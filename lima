@@ -1,0 +1,269 @@
+library(GEOquery)
+library(limma)
+library(WebGestaltR)
+library(openxlsx)
+
+
+# Load GEO dataset
+load_geo_data <- function(geo_id, gpl_id) {
+  
+  gset <- getGEO(geo_id, GSEMatrix = TRUE, getGPL = FALSE)
+  
+  if (length(gset) > 1) {
+    gset <- gset[[grep(gpl_id, names(gset))]]
+  } else {
+    gset <- gset[[1]]
+  }
+  
+  return(gset)
+}
+
+
+# Log2 transform if necessary
+log2_transform <- function(ex) {
+  
+  qx <- quantile(
+    ex,
+    c(0, 0.25, 0.5, 0.75, 0.99, 1),
+    na.rm = TRUE
+  )
+  
+  log_needed <- qx[5] > 100 || (qx[6] - qx[1] > 50 && qx[2] > 0)
+  
+  if (log_needed) {
+    ex[ex <= 0] <- NA
+    ex <- log2(ex)
+  }
+  
+  return(ex)
+}
+
+
+# Differential expression analysis
+run_limma <- function(ex, group) {
+  
+  design <- model.matrix(~ 0 + group)
+  colnames(design) <- levels(group)
+  
+  contrast.matrix <- makeContrasts(
+    Treatment - Control,
+    levels = design
+  )
+  
+  fit <- lmFit(ex, design)
+  fit <- contrasts.fit(fit, contrast.matrix)
+  fit <- eBayes(fit)
+  
+  results <- topTable(
+    fit,
+    coef = 1,
+    number = Inf
+  )
+  
+  return(na.omit(results))
+}
+
+
+# Filter DEGs
+filter_degs <- function(results, fdr = 0.05, logfc = log2(1.5)) {
+  
+  results <- results[
+    results$adj.P.Val < fdr &
+    abs(results$logFC) >= logfc,
+  ]
+  
+  return(results)
+}
+
+
+# Annotate genes
+annotate_genes <- function(results) {
+  
+  gene_ids <- gsub("_at$", "", rownames(results))
+  
+  mart <- useMart(
+    "ensembl",
+    "hsapiens_gene_ensembl",
+    host = "https://dec2021.archive.ensembl.org"
+  )
+  
+  annotation <- getBM(
+    attributes = c(
+      "ensembl_gene_id",
+      "external_gene_name"
+    ),
+    filters = "ensembl_gene_id",
+    values = gene_ids,
+    mart = mart
+  )
+  
+  results$ensembl_gene_id <- gene_ids
+  
+  results <- merge(
+    results,
+    annotation,
+    by = "ensembl_gene_id",
+    all.x = TRUE
+  )
+  
+  results <- results[
+    !is.na(results$external_gene_name) &
+    results$external_gene_name != "",
+  ]
+  
+  results <- results[
+    !duplicated(results$external_gene_name),
+  ]
+  
+  rownames(results) <- results$external_gene_name
+  
+  results$ensembl_gene_id <- NULL
+  results$external_gene_name <- NULL
+  
+  return(results)
+}
+
+
+# Pathway enrichment
+run_pathway_analysis <- function(
+  genes,
+  reference_file,
+  output_dir,
+  project_name
+) {
+  
+  databases <- c(
+    "pathway_KEGG",
+    "geneontology_Biological_Process_noRedundant",
+    "pathway_Reactome",
+    "community-contributed_Hallmark50"
+  )
+  
+  results <- WebGestaltR(
+    enrichMethod = "ORA",
+    organism = "hsapiens",
+    enrichDatabase = databases,
+    interestGene = genes,
+    interestGeneType = "genesymbol",
+    referenceGeneFile = reference_file,
+    referenceGeneType = "entrezgene_protein-coding",
+    isOutput = TRUE,
+    outputDirectory = output_dir,
+    projectName = project_name,
+    fdrThr = 1
+  )
+  
+  results <- results[results$pValue < 0.05, ]
+  
+  return(results)
+}
+
+
+# Main analysis
+main <- function(
+  geo_id,
+  gpl_id,
+  group,
+  gene,
+  folder_dir,
+  ref_file
+) {
+  
+  # Load data
+  gset <- load_geo_data(geo_id, gpl_id)
+  ex <- exprs(gset)
+  
+  # Log2 transformation
+  ex <- log2_transform(ex)
+  
+  # Differential expression analysis
+  nrDEG <- run_limma(ex, group)
+  
+  # Gene annotation
+  nrDEG <- annotate_genes(nrDEG)
+  
+  # Filter DEGs
+  degs <- filter_degs(nrDEG)
+  
+  # Pathway analysis
+  pathway <- run_pathway_analysis(
+    rownames(degs),
+    ref_file,
+    folder_dir,
+    gene
+  )
+  
+  # Create output directory if needed
+  dir.create(
+    folder_dir,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+  
+  # Save results
+  output_file <- file.path(
+    folder_dir,
+    paste0(gene, ".xlsx")
+  )
+  
+  wb <- createWorkbook()
+  
+  addWorksheet(wb, "S1_Limma")
+  writeData(
+    wb,
+    "S1_Limma",
+    cbind(Gene = rownames(nrDEG), nrDEG)
+  )
+  
+  addWorksheet(wb, "S2_DEGs")
+  writeData(
+    wb,
+    "S2_DEGs",
+    cbind(Gene = rownames(degs), degs)
+  )
+  
+  addWorksheet(wb, "S3_Pathway")
+  writeData(
+    wb,
+    "S3_Pathway",
+    pathway
+  )
+  
+  saveWorkbook(
+    wb,
+    output_file,
+    overwrite = TRUE
+  )
+  
+  return(
+    list(
+      limma = nrDEG,
+      degs = degs,
+      pathway = pathway
+    )
+  )
+}
+
+
+# Run analysis
+
+group <- factor(
+  c(
+    "Control",
+    "Control",
+    "Control",
+    "Treatment",
+    "Treatment",
+    "Treatment"
+  ),
+  levels = c("Control", "Treatment")
+)
+
+main(
+  geo_id = "GSE60990",
+  gpl_id = "GPL19145",
+  group = group,
+  gene = "GNB1",
+  folder_dir = "2024-2-3/GEO/result/",
+  ref_file = "2024-2-3/GEO/genome protein-coding.txt"
+)
